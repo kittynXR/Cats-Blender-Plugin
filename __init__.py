@@ -1,6 +1,6 @@
 # MIT License
 
-CATS_VERSION = "5.0.2.2"
+CATS_VERSION = "5.1.0.0"
 dev_branch = False
 
 import os
@@ -163,14 +163,14 @@ def remove_corrupted_files():
 
 
 def check_unsupported_blender_versions():
-    # Don't allow Blender versions older than 4.5
-    if bpy.app.version < (5, 0):
+    # Don't allow Blender versions older than 5.1
+    if bpy.app.version < (5, 1):
         unregister()
         sys.tracebacklimit = 0
         raise ImportError(t('Main.error.29unsupportedVersion'))
-     
-    # Don't allow 5.0+
-    if bpy.app.version >= (5, 1):
+
+    # Don't allow 5.2+
+    if bpy.app.version >= (5, 2):
         sys.tracebacklimit = 0
         raise ImportError(t('Main.error.40unsupportedVersion'))
 

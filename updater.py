@@ -421,18 +421,25 @@ def get_github_releases(repo):
 
     try:
         ssl._create_default_https_context = ssl._create_unverified_context
-        with urllib.request.urlopen('https://git.disroot.org/api/v1/repos/Neoneko/Cats-Blender-Plugin/releases') as url:
+        # GitHub's API rejects requests without a User-Agent header
+        req = urllib.request.Request(
+            'https://api.github.com/repos/kittynXR/Cats-Blender-Plugin/releases',
+            headers={'User-Agent': 'Cats-Blender-Plugin-Updater'}
+        )
+        with urllib.request.urlopen(req) as url:
             data = json.loads(url.read().decode())
     except urllib.error.URLError:
         print('URL ERROR')
         return False
     if not data:
         return False
-    
+
     # Determine tag prefix based on Blender version
     tag_prefix = ""
     if bpy.app.version >= (5, 0) and bpy.app.version < (5, 1):
         tag_prefix = "5.0."
+    elif bpy.app.version >= (5, 1) and bpy.app.version < (5, 2):
+        tag_prefix = "5.1."
 
     for version in data:
         full_tag = version.get('tag_name')
@@ -544,9 +551,8 @@ def update_now(version=None, latest=False, dev=False):
         return
     if dev:
         print('UPDATE TO DEVELOPMENT')
-        # Dynamically construct dev branch URL based on major version
-        major_version = CATS_VERSION.split('.')[0]
-        update_link = f'https://git.disroot.org/Neoneko/Cats-Blender-Plugin/archive/blender-{major_version}x-dev.zip'
+        # Dev branch archive on the GitHub fork
+        update_link = 'https://github.com/kittynXR/Cats-Blender-Plugin/archive/refs/heads/blender-51-dev.zip'
     elif latest or not version:
         print('UPDATE TO ' + latest_version_str)
         update_link = version_list.get(latest_version_str)[0]
@@ -999,4 +1005,5 @@ def unregister():
     if hasattr(bpy.types.Scene, 'cats_updater_version_list'):
         del bpy.types.Scene.cats_updater_version_list
 
-        del bpy.types.Scene.cats_updater_version_list
+    if hasattr(bpy.types.Scene, 'cats_update_action'):
+        del bpy.types.Scene.cats_update_action
