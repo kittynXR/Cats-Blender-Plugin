@@ -769,9 +769,11 @@ def get_meshes_objects(armature_name=None, mode=0, check=True, visible_only=Fals
                     meshes.append(ob)
 
     if visible_only:
-        for mesh in meshes:
-            if is_hidden(mesh):
-                meshes.remove(mesh)
+        # Do not remove items from ``meshes`` while iterating over it.  Apart
+        # from skipping every second hidden object, ``hide_get`` only covers
+        # the object's local hide flag and misses collection/view-layer
+        # visibility.
+        meshes = [mesh for mesh in meshes if is_object_visible(mesh)]
 
     # Check for broken meshes and delete them
     if check:
@@ -798,38 +800,88 @@ def get_meshes_objects(armature_name=None, mode=0, check=True, visible_only=Fals
 
     return meshes
 
-def get_meshes_objects_for_export(armature_name=None, mode=0, check=True):
+def is_object_visible(obj, context=None):
+    """Return whether *obj* is visible in the active view layer.
+
+    ``Object.hide_get()`` does not account for collection and view-layer
+    visibility.  Export scope must use Blender's effective visibility so the
+    preflight describes the objects the user can actually see.
+    """
+    context = context or bpy.context
+    try:
+        return obj.visible_get(view_layer=context.view_layer)
+    except (AttributeError, TypeError, RuntimeError):
+        # ``visible_get`` has had slightly different signatures in supported
+        # Blender versions.  Keep a conservative fallback for older builds.
+        try:
+            return obj.visible_get()
+        except (AttributeError, TypeError, RuntimeError):
+            return not is_hidden(obj)
+
+
+def _is_descendant_of(obj, ancestor):
+    parent = obj.parent
+    while parent:
+        if parent == ancestor:
+            return True
+        parent = parent.parent
+    return False
+
+
+def _uses_armature_modifier(obj, armature):
+    return any(
+        modifier.type == 'ARMATURE' and modifier.object == armature
+        for modifier in obj.modifiers
+    )
+
+
+def get_avatar_export_scope(armature_name=None):
+    """Return the armature, meshes and objects in the CATS avatar FBX scope.
+
+    A mesh belongs to the selected CATS armature when it is visible in the
+    current view layer and either is a recursive descendant of that armature
+    or has an Armature modifier targeting it.  The returned object list adds
+    the target armature and visible parent empties needed to preserve object
+    transforms.  Its mesh members are therefore exactly the returned mesh
+    list used by export preflight.
+    """
     context = bpy.context
-    if not armature_name:
-        armature = get_armature()
-        if armature:
-            armature_name = armature.name
+    armature = get_armature(armature_name=armature_name)
+    if armature is None:
+        return None, [], []
 
-    meshes = []
-    
-    for ob in get_objects():
-        if ob is None or ob.type != 'MESH':
-            continue
-            
-        # Only include visible meshes
-        if is_hidden(ob):
-            continue
-            
-        if mode == 0 or mode == 5: 
-            if ob.parent:
-                if ob.parent.type == 'ARMATURE' and ob.parent.name == armature_name:
-                    meshes.append(ob)
-                elif ob.parent.parent and ob.parent.parent.type == 'ARMATURE' and ob.parent.parent.name == armature_name:
-                    meshes.append(ob)
-        elif mode == 1:
-            if not ob.parent:
-                meshes.append(ob)
-        elif mode == 2:
-            meshes.append(ob)
-        elif mode == 3:
-            if ob.select_get():
-                meshes.append(ob)
+    meshes = [
+        obj for obj in get_objects()
+        if obj is not None
+        and obj.type == 'MESH'
+        and is_object_visible(obj, context)
+        and (_is_descendant_of(obj, armature) or _uses_armature_modifier(obj, armature))
+    ]
+    meshes.sort(key=lambda obj: obj.name.casefold())
 
+    export_objects = {armature, *meshes}
+
+    # Empty parents carry transforms but do not change the authoritative mesh
+    # count.  Do not pull unrelated mesh/armature parents into the FBX scope.
+    for obj in (armature, *meshes):
+        parent = obj.parent
+        while parent:
+            if (parent.type == 'EMPTY'
+                    and parent.instance_type == 'NONE'
+                    and is_object_visible(parent, context)):
+                export_objects.add(parent)
+            parent = parent.parent
+
+    return armature, meshes, sorted(export_objects, key=lambda obj: obj.name.casefold())
+
+
+def get_meshes_objects_for_export(armature_name=None, mode=0, check=True):
+    """Compatibility wrapper for the authoritative avatar export meshes.
+
+    ``mode`` and ``check`` are retained for API compatibility.  FBX export has
+    one deliberately fixed scope, so they no longer alter the returned list.
+    """
+    _armature, meshes, _objects = get_avatar_export_scope(armature_name)
     return meshes
 
 def join_meshes(armature_name=None, mode=0, apply_transformations=True, repair_shape_keys=True):

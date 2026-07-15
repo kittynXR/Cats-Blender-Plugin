@@ -30,7 +30,6 @@ import bpy
 from threading import Lock
 import urllib
 import urllib.request
-import ssl
 import json
 import os
 import zipfile
@@ -45,8 +44,8 @@ def get_separator():
 
 
 def _request(url, json_decode=True):
-    # pylint: disable=W0212
-    ssl._create_default_https_context = ssl._create_unverified_context
+    if hasattr(bpy.app, "online_access") and not bpy.app.online_access:
+        raise RuntimeError("Online access is disabled in Blender preferences")
     req = urllib.request.Request(url)
 
     try:
@@ -68,6 +67,8 @@ def _request(url, json_decode=True):
 
 
 def _download(url, path):
+    if hasattr(bpy.app, "online_access") and not bpy.app.online_access:
+        raise RuntimeError("Online access is disabled in Blender preferences")
     try:
         urllib.request.urlretrieve(url, path)
     except urllib.error.HTTPError as e:

@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
-# Unoffical Cats Blender Plugin Extenstion
+# Unofficial CATS Blender Plugin extension
 id = "cats_blender_plugin"
-version = "5.1.0"
-name = "Unoffical Cats Blender Plugin"
+version = "5.1.1"
+name = "Unofficial CATS Blender Plugin"
 tagline = "Shorten steps to import and optimize models for VRChat"
 maintainer = "kittyn xr"
 type = "add-on"
@@ -12,9 +12,25 @@ tags = ["3D View", "Modeling", "Mesh", "Object"]
 blender_version_min = "5.1.0"
 blender_version_max = "5.2.0"
 license = [
-  "SPDX:MIT",
+  "SPDX:GPL-3.0-or-later",
 ]
 
 [permissions]
 files = "Import/export models and read bundled resources"
 network = "Check for updates and fetch translations"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  ".*",
+  "/*.zip",
+  "*.blend[1-9]",
+  "*.pyc",
+  "*.pyo",
+  "/tests/",
+  "/resources/settings.json",
+  "/resources/dictionary_google.json",
+  "/resources/google-response*.txt",
+  "/resources/ignore_version.txt",
+  "/resources/no_auto_ver_check.txt",
+]

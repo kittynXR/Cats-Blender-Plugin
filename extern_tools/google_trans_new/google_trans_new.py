@@ -3,14 +3,11 @@
 # version : 1.1.9
 import json, requests, random, re
 from urllib.parse import quote
-from requests.packages import urllib3
 import logging
 from .constant import LANGUAGES, DEFAULT_SERVICE_URLS
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 URLS_SUFFIX = [re.search('translate.google.(.*)', url.strip()).group(1) for url in DEFAULT_SERVICE_URLS]
 URL_SUFFIX_DEFAULT = 'cn'
@@ -142,9 +139,7 @@ class google_translator:
                 self.proxies = {}
             with requests.Session() as s:
                 s.proxies = self.proxies
-                r = s.send(request=response.prepare(),
-                           verify=False,
-                           timeout=self.timeout)
+                r = s.send(request=response.prepare(), timeout=self.timeout)
             for line in r.iter_lines(chunk_size=1024):
                 decoded_line = line.decode('utf-8')
                 if "MkEWBc" in decoded_line:
@@ -237,9 +232,7 @@ class google_translator:
                 self.proxies = {}
             with requests.Session() as s:
                 s.proxies = self.proxies
-                r = s.send(request=response.prepare(),
-                           verify=False,
-                           timeout=self.timeout)
+                r = s.send(request=response.prepare(), timeout=self.timeout)
 
             for line in r.iter_lines(chunk_size=1024):
                 decoded_line = line.decode('utf-8')

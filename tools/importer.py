@@ -12,7 +12,7 @@ import bpy_extras.io_utils
 import time
 import subprocess
 from mathutils import Matrix
-from math import sqrt
+from math import isfinite, sqrt
 
 from .. import globs
 from . import armature_manual
@@ -2001,6 +2001,261 @@ max_meshes_light = 2
 max_meshes_hard = 8
 
 
+def _node_tree_has_image_texture(node_tree, visited=None):
+    """Return whether a shader node tree references an actual image."""
+    if node_tree is None:
+        return False
+
+    visited = visited or set()
+    node_tree_id = node_tree.as_pointer()
+    if node_tree_id in visited:
+        return False
+    visited.add(node_tree_id)
+
+    for node in node_tree.nodes:
+        if node.type == 'TEX_IMAGE' and getattr(node, 'image', None) is not None:
+            return True
+        if node.type == 'GROUP' and _node_tree_has_image_texture(getattr(node, 'node_tree', None), visited):
+            return True
+    return False
+
+
+def _material_has_image_texture(material):
+    return bool(
+        material
+        and material.use_nodes
+        and _node_tree_has_image_texture(material.node_tree)
+    )
+
+
+def _shape_key_is_broken(shape_key, basis_key):
+    """Check the documented first ten vertices for invalid deformation."""
+    for index, (vertex, basis_vertex) in enumerate(zip(shape_key.data, basis_key.data)):
+        if index >= 10:
+            break
+        for coordinate, basis_coordinate in zip(vertex.co, basis_vertex.co):
+            coordinate = float(coordinate)
+            basis_coordinate = float(basis_coordinate)
+            deformation = coordinate - basis_coordinate
+            if (not isfinite(coordinate)
+                    or not isfinite(basis_coordinate)
+                    or not isfinite(deformation)
+                    or abs(deformation) >= 10000):
+                return True
+    return False
+
+
+def _update_avatar_export_checks(meshes):
+    """Populate the error popup from the authoritative FBX mesh scope."""
+    global _meshes_count, _tris_count, _mat_list, _broken_shapes, _textures_found, _eye_meshes_not_named_body
+
+    _meshes_count = len(meshes)
+    _tris_count = 0
+    _mat_list = []
+    _broken_shapes = []
+    _textures_found = False
+    _eye_meshes_not_named_body = []
+
+    body_exists = any(mesh.name == 'Body' for mesh in meshes)
+
+    for mesh in meshes:
+        # The FBX exporter triangulates faces.  Loop triangles model that
+        # output; polygon count under-counts every quad and n-gon.
+        mesh.data.calc_loop_triangles()
+        _tris_count += len(mesh.data.loop_triangles)
+
+        for material_slot in mesh.material_slots:
+            material = material_slot.material if material_slot else None
+            if material is None:
+                continue
+            if material.name not in _mat_list:
+                _mat_list.append(material.name)
+            if _material_has_image_texture(material):
+                _textures_found = True
+
+        if not Common.has_shapekeys(mesh):
+            continue
+
+        key_blocks = mesh.data.shape_keys.key_blocks
+        basis_key = key_blocks[0]
+        for shape_key in key_blocks[1:]:
+            if _shape_key_is_broken(shape_key, basis_key) and shape_key.name not in _broken_shapes:
+                _broken_shapes.append(shape_key.name)
+
+        if not body_exists and mesh.name not in _eye_meshes_not_named_body:
+            if any(shape_key.name.startswith(('vrc.blink', 'vrc.lower')) for shape_key in key_blocks[1:]):
+                _eye_meshes_not_named_body.append(mesh.name)
+
+
+def _avatar_export_has_warnings():
+    return (
+        _meshes_count > max_meshes_light
+        or _tris_count > max_tris
+        or len(_mat_list) > max_mats
+        or bool(_broken_shapes)
+        or (not _textures_found and Settings.get_embed_textures())
+        or bool(_eye_meshes_not_named_body)
+    )
+
+
+def _walk_layer_collections(layer_collection):
+    yield layer_collection
+    for child in layer_collection.children:
+        yield from _walk_layer_collections(child)
+
+
+@register_wrap
+class ExportFBX(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
+    """CATS-owned FBX picker that keeps export scope aligned with preflight."""
+    bl_idname = 'cats_importer.export_fbx'
+    bl_label = t('ExportModel.label')
+    bl_description = t('ExportModel.desc')
+    bl_options = {'INTERNAL'}
+
+    filename_ext = '.fbx'
+    filter_glob = bpy.props.StringProperty(default='*.fbx', options={'HIDDEN'})
+
+    def execute(self, context):
+        armature, meshes, export_objects = Common.get_avatar_export_scope()
+        _update_avatar_export_checks(meshes)
+
+        if armature is None:
+            self.report({'ERROR'}, 'No armature is selected for export.')
+            return {'CANCELLED'}
+        if not meshes:
+            self.report({'ERROR'}, 'The selected armature has no visible avatar meshes to export.')
+            return {'CANCELLED'}
+
+        view_layer = context.view_layer
+        selected_before = [obj for obj in view_layer.objects if obj.select_get()]
+        active_before = view_layer.objects.active
+        state_objects = set(export_objects) | set(selected_before)
+        if active_before is not None:
+            state_objects.add(active_before)
+        object_visibility_before = {
+            obj: (obj.hide_select, obj.hide_viewport, obj.hide_get(view_layer=view_layer))
+            for obj in state_objects
+        }
+        all_layer_collections = list(_walk_layer_collections(view_layer.layer_collection))
+        layer_collections = [
+            layer_collection
+            for layer_collection in all_layer_collections
+            if any(obj.name in layer_collection.collection.all_objects for obj in state_objects)
+        ]
+        collections = list(dict.fromkeys(
+            layer_collection.collection for layer_collection in layer_collections
+        ))
+        collection_visibility_before = {
+            collection: (collection.hide_select, collection.hide_viewport)
+            for collection in collections
+        }
+        layer_visibility_before = {
+            layer_collection: layer_collection.hide_viewport
+            for layer_collection in layer_collections
+        }
+
+        path_mode = 'COPY' if _textures_found and Settings.get_embed_textures() else 'AUTO'
+
+        try:
+            # Selection and local/collection visibility locks can prevent
+            # select_set() from changing state.  Temporarily unlock and unhide
+            # the view layer so use_selection=True is authoritative even for a
+            # normally hidden rig, then restore every flag below.
+            for collection in collections:
+                try:
+                    if collection.hide_select:
+                        collection.hide_select = False
+                    if collection.hide_viewport:
+                        collection.hide_viewport = False
+                except (ReferenceError, RuntimeError):
+                    pass
+            for layer_collection in layer_collections:
+                try:
+                    if layer_collection.hide_viewport:
+                        layer_collection.hide_viewport = False
+                except (ReferenceError, RuntimeError):
+                    pass
+            view_layer.update()
+            for obj in state_objects:
+                if obj.hide_select:
+                    obj.hide_select = False
+                if obj.hide_viewport:
+                    obj.hide_viewport = False
+                if obj.hide_get(view_layer=view_layer):
+                    obj.hide_set(False, view_layer=view_layer)
+
+            for obj in selected_before:
+                obj.select_set(False)
+                if obj.select_get():
+                    raise RuntimeError("Object '{}' cannot be deselected for export".format(obj.name))
+            for obj in export_objects:
+                obj.select_set(True)
+                if not obj.select_get():
+                    raise RuntimeError("Object '{}' cannot be selected for export".format(obj.name))
+            view_layer.objects.active = armature
+
+            export_result = bpy.ops.export_scene.fbx(
+                'EXEC_DEFAULT',
+                filepath=self.filepath,
+                use_selection=True,
+                use_visible=False,
+                use_active_collection=False,
+                object_types={'EMPTY', 'ARMATURE', 'MESH'},
+                use_mesh_modifiers=False,
+                add_leaf_bones=False,
+                bake_anim=False,
+                apply_scale_options='FBX_SCALE_ALL',
+                path_mode=path_mode,
+                embed_textures=Settings.get_embed_textures(),
+            )
+            if 'FINISHED' not in export_result:
+                self.report({'ERROR'}, 'FBX export was cancelled.')
+                return {'CANCELLED'}
+        except AttributeError:
+            self.report({'ERROR'}, t('ExportModel.error.notEnabled'))
+            return {'CANCELLED'}
+        except (RuntimeError, TypeError, ValueError) as error:
+            self.report({'ERROR'}, 'FBX export failed: {}'.format(error))
+            return {'CANCELLED'}
+        finally:
+            # Export is synchronous.  Restore the user's exact selection and
+            # active object even when Blender's exporter raises an error.
+            for obj in export_objects:
+                try:
+                    obj.select_set(False)
+                except ReferenceError:
+                    pass
+            for obj in selected_before:
+                try:
+                    obj.select_set(True)
+                except ReferenceError:
+                    pass
+            try:
+                view_layer.objects.active = active_before
+            except (ReferenceError, RuntimeError):
+                view_layer.objects.active = None
+            for obj, (hide_select, hide_viewport, hidden) in object_visibility_before.items():
+                try:
+                    obj.hide_set(hidden, view_layer=view_layer)
+                    obj.hide_viewport = hide_viewport
+                    obj.hide_select = hide_select
+                except (ReferenceError, RuntimeError):
+                    pass
+            for layer_collection, hide_viewport in layer_visibility_before.items():
+                try:
+                    layer_collection.hide_viewport = hide_viewport
+                except ReferenceError:
+                    pass
+            for collection, (hide_select, hide_viewport) in collection_visibility_before.items():
+                try:
+                    collection.hide_viewport = hide_viewport
+                    collection.hide_select = hide_select
+                except ReferenceError:
+                    pass
+
+        return {'FINISHED'}
+
+
 @register_wrap
 class ExportModel(bpy.types.Operator):
     bl_idname = 'cats_importer.export_model'
@@ -2015,105 +2270,25 @@ class ExportModel(bpy.types.Operator):
     filepath = bpy.props.StringProperty()
 
     def execute(self, context):
-        meshes = Common.get_meshes_objects_for_export()
+        _armature, meshes, _export_objects = Common.get_avatar_export_scope()
+        _update_avatar_export_checks(meshes)
 
-        # Check for warnings
-        if not self.action == 'NO_CHECK':
-            global _meshes_count, _tris_count, _mat_list, _broken_shapes, _textures_found, _eye_meshes_not_named_body
+        # Keep the existing warning popup/continue flow, but make both paths
+        # use the same freshly-computed scope and diagnostics.
+        if self.action != 'NO_CHECK' and _avatar_export_has_warnings():
+            bpy.ops.cats_importer.display_error('INVOKE_DEFAULT')
+            return {'FINISHED'}
 
-            # Reset export checks
-            _meshes_count = 0
-            _tris_count = 0
-            _mat_list = []
-            _broken_shapes = []
-            _textures_found = False
-            _eye_meshes_not_named_body = []
-
-            body_extists = False
-            for mesh in meshes:
-                if mesh.name == 'Body':
-                    body_extists = True
-                    break
-
-            # Check for export warnings
-            for mesh in meshes:
-                # Check mesh count
-                _meshes_count += 1
-
-                # Check tris count
-                _tris_count += len(mesh.data.polygons)
-
-                # Check material count
-                for mat_slot in mesh.material_slots:
-                    if mat_slot and mat_slot.material and mat_slot.material.users and mat_slot.material.name not in _mat_list:
-                        _mat_list.append(mat_slot.material.name)
-                        _textures_found = True
-                        
-                if Common.has_shapekeys(mesh):
-                    # Check if there are broken shapekeys
-                    for shapekey in mesh.data.shape_keys.key_blocks[1:]:
-                        vert_count = 0
-                        for vert in shapekey.data:
-                            vert_count += 1
-                            for coord in vert.co:
-                                if coord >= 10000:
-                                    _broken_shapes.append(shapekey.name)
-                                    vert_count = 1000
-                                    break
-                            # Only check the first 10 vertices of this shapekey
-                            if vert_count == 1000:
-                                break
-
-                    # Check if there are meshes with eye tracking, but are not named Body
-                    if not body_extists:
-                        for shapekey in mesh.data.shape_keys.key_blocks[1:]:
-                            if mesh.name not in _eye_meshes_not_named_body:
-                                if shapekey.name.startswith(('vrc.blink', 'vrc.lower')):
-                                    _eye_meshes_not_named_body.append(mesh.name)
-                                    break
-
-            # Check if a warning should be shown
-            if _meshes_count > max_meshes_light \
-                    or _tris_count > max_tris \
-                    or len(_mat_list) > max_mats \
-                    or len(_broken_shapes) > 0 \
-                    or not _textures_found and Settings.get_embed_textures()\
-                    or len(_eye_meshes_not_named_body) > 0:
-                bpy.ops.cats_importer.display_error('INVOKE_DEFAULT')
-                return {'FINISHED'}
-
-        # Continue if there are no errors or the check was skipped
-
-        # Check if textures are found and if they should be embedded
-        path_mode = 'AUTO'
-        if _textures_found and Settings.get_embed_textures():
-            path_mode = 'COPY'
-
-        # Open export window
         try:
             if self.filepath:
-                bpy.ops.export_scene.fbx('EXEC_DEFAULT',
-                                         filepath=self.filepath,
-                                         object_types={'EMPTY', 'ARMATURE', 'MESH', 'OTHER'},
-                                         use_mesh_modifiers=False,
-                                         add_leaf_bones=False,
-                                         bake_anim=False,
-                                         apply_scale_options='FBX_SCALE_ALL',
-                                         path_mode=path_mode,
-                                         embed_textures=True,)
+                result = bpy.ops.cats_importer.export_fbx('EXEC_DEFAULT', filepath=self.filepath)
             else:
-                bpy.ops.export_scene.fbx('INVOKE_DEFAULT',
-                                         object_types={'EMPTY', 'ARMATURE', 'MESH', 'OTHER'},
-                                         use_mesh_modifiers=False,
-                                         add_leaf_bones=False,
-                                         bake_anim=False,
-                                         apply_scale_options='FBX_SCALE_ALL',
-                                         path_mode=path_mode,
-                                         embed_textures=True,)
-        except (TypeError, ValueError):
-            bpy.ops.export_scene.fbx('INVOKE_DEFAULT')
+                result = bpy.ops.cats_importer.export_fbx('INVOKE_DEFAULT')
+            if 'CANCELLED' in result:
+                return {'CANCELLED'}
         except AttributeError:
             self.report({'ERROR'}, t('ExportModel.error.notEnabled'))
+            return {'CANCELLED'}
 
         return {'FINISHED'}
 

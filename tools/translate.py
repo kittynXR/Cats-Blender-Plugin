@@ -5,7 +5,6 @@ import os
 import bpy
 import copy
 import json
-import pathlib
 import traceback
 import collections
 import requests.exceptions
@@ -15,8 +14,8 @@ from datetime import datetime, timezone
 from collections import OrderedDict
 
 from . import common as Common
-from pathlib import Path
 from .register import register_wrap
+from . import paths as Paths
 from .. import globs
 # from ..googletrans import Translator  # TODO Remove this
 from ..extern_tools.google_trans_new.google_trans_new import google_translator
@@ -27,19 +26,13 @@ from mmd_tools_local import translations as mmd_translations
 dictionary = {}
 dictionary_google = {}
 
-main_dir = pathlib.Path(os.path.dirname(__file__)).parent.resolve()
-resources_dir = os.path.join(str(main_dir), "resources")
-dictionary_file = os.path.join(resources_dir, "dictionary.json")
-dictionary_google_file = os.path.join(resources_dir, "dictionary_google.json")
+dictionary_file = str(Paths.BUNDLED_DICTIONARY_FILE)
+dictionary_google_file = str(Paths.GOOGLE_DICTIONARY_CACHE_FILE)
 
 def get_cats_dir(context):
-    prefs = context.preferences.addons["cats-blender-plugin"].preferences
-    
-    if prefs.custom_shapekeys_export_dir: 
-        return prefs.custom_shapekeys_export_dir
-    
-    # Fallback to default cats directory
-    return os.path.join(bpy.utils.user_resource('DATAFILES'), "cats") 
+    # Translation exports are user data and must not depend on the extension's
+    # dynamically assigned package name.
+    return str(Paths.TRANSLATION_EXPORT_DIR)
 
 @register_wrap
 class TranslateShapekeyButton(bpy.types.Operator):
@@ -509,18 +502,34 @@ def load_translations():
     temp_dict = OrderedDict()
     dict_found = False
 
-    # Load internal dictionary
-    try:
-        with open(dictionary_file, encoding="utf8") as file:
-            temp_dict = json.load(file, object_pairs_hook=collections.OrderedDict)
+    # Keep the immutable bundled dictionary as the base, then overlay a
+    # validated user-downloaded dictionary.
+    for internal_dictionary_file in (
+        Paths.BUNDLED_DICTIONARY_FILE,
+        Paths.DOWNLOADED_DICTIONARY_FILE,
+    ):
+        if not internal_dictionary_file.is_file():
+            continue
+        try:
+            with internal_dictionary_file.open(encoding="utf8") as file:
+                loaded_dictionary = json.load(
+                    file,
+                    object_pairs_hook=collections.OrderedDict,
+                )
+            if not isinstance(loaded_dictionary, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in loaded_dictionary.items()
+            ):
+                raise ValueError("dictionary must contain string key/value pairs")
+            temp_dict.update(loaded_dictionary)
             dict_found = True
-            # print('DICTIONARY LOADED!')
-    except FileNotFoundError:
-        print('DICTIONARY NOT FOUND!')
-        pass
-    except json.decoder.JSONDecodeError:
-        print("ERROR FOUND IN DICTIONARY")
-        pass
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            print(f"ERROR FOUND IN DICTIONARY {internal_dictionary_file}: {error}")
+
+    Paths.migrate_legacy_file(
+        Paths.BUNDLED_RESOURCES_DIR / "dictionary_google.json",
+        Paths.GOOGLE_DICTIONARY_CACHE_FILE,
+    )
 
     # Load local google dictionary and add it to the temp dict
     try:
@@ -622,6 +631,11 @@ def update_dictionary(to_translate_list, translating_shapes=False, self=None):
 
     if not google_input:
         # print('NO GOOGLE TRANSLATIONS')
+        return
+
+    if not getattr(bpy.app, "online_access", True):
+        if self:
+            self.report({'ERROR'}, "Online access is disabled in Blender preferences")
         return
 
     # Translate the rest with google translate
@@ -779,8 +793,7 @@ def reset_google_dict():
 
 
 def save_google_dict():
-    with open(dictionary_google_file, 'w', encoding="utf8") as outfile:
-        json.dump(dictionary_google, outfile, ensure_ascii=False, indent=4)
+    Paths.atomic_write_json(dictionary_google_file, dictionary_google)
 
 
 # Check if shape key meets translation conditions

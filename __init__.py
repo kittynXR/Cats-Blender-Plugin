@@ -1,19 +1,31 @@
 # MIT License
 
-CATS_VERSION = "5.1.0.0"
+CATS_VERSION = "5.1.1.0"
 dev_branch = False
+
+# Each release line declares the Blender versions it has actually been tested
+# against.  The upper bound is exclusive so the 5.1 bridge cannot silently be
+# enabled on a future Blender API.
+BLENDER_VERSION_MIN = (5, 1, 0)
+BLENDER_VERSION_MAX = (5, 2, 0)
 
 import os
 import sys
 
-# Append files to sys path
+# Append bundled tools to sys.path before importing mmd_tools_local.  Blender
+# can call register/unregister more than once without re-importing this module,
+# so register() restores the path after unregister() removes it.
 file_dir = os.path.join(os.path.dirname(__file__), 'extern_tools')
-if file_dir not in sys.path:
-    sys.path.append(file_dir)
 
-import shutil
+
+def _ensure_external_tools_path():
+    if file_dir not in sys.path:
+        sys.path.append(file_dir)
+
+
+_ensure_external_tools_path()
+
 import pathlib
-import requests
 
 from importlib.util import find_spec
 
@@ -65,114 +77,40 @@ from .tools.translations import t
 
 
 def remove_corrupted_files():
-    to_remove = [
-        'googletrans',
-        'mmd_tools_local',
-        'extern_tools',
-        'resources',
-        'tests',
-        'tools',
-        'ui',
-        '.gitignore',
-        '.travis.yml',
-        'LICENSE',
-        'README.md',
-        '__init__.py',
-        'addon_updater.py',
-        'addon_updater_ops.py',
-        'extensions.py',
-        'globs.py',
-        'updater.py',
-    ]
+    """Validate the package without modifying files outside the extension.
 
-    no_perm = False
-    os_error = False
-    wrong_path = False
-    faulty_installation = False
-    main_dir = str(pathlib.Path(os.path.dirname(__file__)).resolve())
-
-    if main_dir.endswith('addons'):
-        print(os.path.dirname(__file__))
-        print(main_dir)
-        print('Wrong installation path')
-        wrong_path = True
-    else:
-        main_dir = str(pathlib.Path(os.path.dirname(__file__)).parent.resolve())
-
-    # print('Checking for CATS files in the addon directory:\n' + main_dir)
-    files = [f for f in os.listdir(main_dir) if os.path.isfile(os.path.join(main_dir, f))]
-    folders = [f for f in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, f))]
-
-    for file in files:
-        if file in to_remove:
-            file_path = os.path.join(main_dir, file)
-            try:
-                os.remove(file_path)
-                faulty_installation = True
-                print('REMOVED', file)
-            except PermissionError:
-                no_perm = True
-                print("Permissions: Failed to remove file " + file)
-            except OSError:
-                os_error = True
-                print("OS: Failed to remove file " + file)
-
-    for folder in folders:
-        if folder in to_remove:
-            folder_path = os.path.join(main_dir, folder)
-            try:
-                shutil.rmtree(folder_path)
-                faulty_installation = True
-                print('REMOVED', folder)
-            except PermissionError:
-                no_perm = True
-                print("Permissions: Failed to remove folder " + folder)
-            except OSError:
-                os_error = True
-                print("Failed to remove folder " + folder)
-
-    if no_perm:
-        unregister()
+    Older releases tried to repair malformed installs by deleting generic file
+    and directory names from the package's parent directory.  With Blender
+    extensions that parent can contain unrelated add-ons, so repair must never
+    happen automatically.  Keep this legacy entry point for compatibility and
+    report an incomplete package instead.
+    """
+    package_dir = pathlib.Path(__file__).resolve().parent
+    required_paths = (
+        package_dir / 'extern_tools',
+        package_dir / 'resources',
+        package_dir / 'tools',
+        package_dir / 'ui',
+        package_dir / 'globs.py',
+        package_dir / 'updater.py',
+    )
+    missing = [path.name for path in required_paths if not path.exists()]
+    if missing:
         sys.tracebacklimit = 0
-        raise ImportError(t('Main.error.restartAdmin'))
-
-    if os_error:
-        unregister()
-        sys.tracebacklimit = 0
-        message = t('Main.error.deleteFollowing')
-
-        for folder in folders:
-            if folder in to_remove:
-                message += "\n- " + os.path.join(main_dir, folder)
-
-        for file in files:
-            if file in to_remove:
-                message += "\n- " + os.path.join(main_dir, file)
-
-        raise ImportError(message)
-
-    if wrong_path:
-        unregister()
-        sys.tracebacklimit = 0
-        raise ImportError(t('Main.error.installViaPreferences'))
-
-    if faulty_installation:
-        unregister()
-        sys.tracebacklimit = 0
-        raise ImportError(t('Main.error.restartAndEnable'))
+        raise ImportError(
+            'CATS installation is incomplete; missing: ' + ', '.join(missing)
+        )
 
 
 def check_unsupported_blender_versions():
-    # Don't allow Blender versions older than 5.1
-    if bpy.app.version < (5, 1):
-        unregister()
+    if not BLENDER_VERSION_MIN <= bpy.app.version < BLENDER_VERSION_MAX:
+        minimum = '.'.join(str(part) for part in BLENDER_VERSION_MIN)
+        maximum = '.'.join(str(part) for part in BLENDER_VERSION_MAX)
         sys.tracebacklimit = 0
-        raise ImportError(t('Main.error.29unsupportedVersion'))
-
-    # Don't allow 5.2+
-    if bpy.app.version >= (5, 2):
-        sys.tracebacklimit = 0
-        raise ImportError(t('Main.error.40unsupportedVersion'))
+        raise ImportError(
+            f'CATS {CATS_VERSION} supports {minimum} <= Blender < {maximum}; '
+            f'current Blender is {bpy.app.version_string}.'
+        )
 
 def set_cats_version_string():
     version_parts = CATS_VERSION.split(".")
@@ -195,6 +133,8 @@ def set_cats_version_string():
 
 def register():
     print("\n### Loading CATS...")
+
+    _ensure_external_tools_path()
 
     # Check for unsupported Blender versions
     check_unsupported_blender_versions()
@@ -243,15 +183,16 @@ def register():
     # Register all classes
     count = 0
     tools.register.order_classes()
-    for cls in tools.register.__bl_classes:
+    classes = tools.register.__bl_ordered_classes
+    for cls in classes:
         try:
             bpy.utils.register_class(cls)
             count += 1
         except ValueError:
             pass
     # print('Registered', count, 'CATS classes.')
-    if count < len(tools.register.__bl_classes):
-        print('Skipped', len(tools.register.__bl_classes) - count, 'CATS classes.')
+    if count < len(classes):
+        print('Skipped', len(classes) - count, 'CATS classes.')
 
     # Register Scene types
     extentions.register()
@@ -275,9 +216,6 @@ def register():
     # Add shapekey button to shapekey menu
     bpy.types.MESH_MT_shape_key_context_menu.append(tools.shapekey.addToShapekeyMenu)
 
-    # Disable request warning when using google translate
-    requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
-
     # Apply the settings after a short time, because you can't change checkboxes during register process
     tools.settings.start_apply_settings_timer()
 
@@ -286,6 +224,9 @@ def register():
 
 def unregister():
     print("### Unloading CATS...")
+
+    # Stop callbacks before removing the Scene properties they access.
+    tools.settings.stop_apply_settings_threads()
 
     # Unregister updater
     updater.unregister()
@@ -312,6 +253,8 @@ def unregister():
             pass 
 
     # Unload all classes in reverse order
+    extentions.unregister()
+
     count = 0
     for cls in reversed(tools.register.__bl_ordered_classes):
         try:
@@ -328,16 +271,13 @@ def unregister():
 
     # Remove shapekey button from shapekey menu
     try:
-        bpy.types.MESH_MT_shape_key_specials.remove(tools.shapekey.addToShapekeyMenu)
-    except AttributeError:
+        bpy.types.MESH_MT_shape_key_context_menu.remove(tools.shapekey.addToShapekeyMenu)
+    except (AttributeError, ValueError):
         print('shapekey button was not registered')
-        pass
 
     # Remove folder from sys path
     if file_dir in sys.path:
         sys.path.remove(file_dir)
-
-    tools.settings.stop_apply_settings_threads()
 
     print("### Unloaded CATS successfully!\n")
 

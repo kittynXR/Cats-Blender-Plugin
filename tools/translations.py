@@ -3,30 +3,67 @@
 # Thanks to https://www.thegrove3d.com/learn/how-to-translate-a-blender-addon/ for the idea
 
 import os
-import csv
-import ssl
+import re
 import bpy
 import json
-import urllib
-import pathlib
-import addon_utils
 import requests
-from bpy.app.translations import locale
 
 from .register import register_wrap
 from . import settings
+from . import paths as Paths
 
-main_dir = pathlib.Path(os.path.dirname(__file__)).parent.resolve()
-resources_dir = os.path.join(str(main_dir), "resources")
-settings_file = os.path.join(resources_dir, "settings.json")
-translations_dir = os.path.join(resources_dir, "translations")
+settings_file = str(Paths.SETTINGS_FILE)
+translations_dir = str(Paths.BUNDLED_TRANSLATIONS_DIR)
 
 dictionary: dict[str, str] = dict()
 languages = []
 verbose = True
 last_loaded_language = None
-dictionary_download_link = "https://github.com/teamneoneko/Cats-Blender-Plugin-Unofficial-translations/blob/4.3-translations/dictionary.json"
+dictionary_download_link = (
+    "https://raw.githubusercontent.com/teamneoneko/"
+    "Cats-Blender-Plugin-Unofficial-translations/5x-translations/dictionary.json"
+)
 _addon_startup_time = None
+
+
+def _available_translation_files():
+    """Return bundled translations overlaid by validated user downloads."""
+    translation_files = {}
+    for directory in (Paths.BUNDLED_TRANSLATIONS_DIR, Paths.USER_TRANSLATIONS_DIR):
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.json"):
+            translation_files[path.stem] = path
+    return translation_files
+
+
+def _load_translation_messages(language):
+    """Load bundled messages and overlay a validated user download."""
+    candidates = (
+        Paths.BUNDLED_TRANSLATIONS_DIR / f"{language}.json",
+        Paths.USER_TRANSLATIONS_DIR / f"{language}.json",
+    )
+    combined_messages = {}
+    loaded_file = None
+    for translation_file in candidates:
+        if not translation_file.is_file():
+            continue
+        try:
+            with translation_file.open('r', encoding='utf8') as file:
+                payload = json.load(file)
+            messages = payload.get("messages")
+            if not isinstance(messages, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in messages.items()
+            ):
+                raise ValueError("messages must contain string key/value pairs")
+            combined_messages.update(messages)
+            loaded_file = translation_file
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            print(f"Invalid translation file {translation_file}: {error}")
+    if loaded_file is None:
+        return None, None
+    return combined_messages, loaded_file
 
 def load_translations(override_language=None):
     global dictionary, languages, last_loaded_language, _addon_startup_time
@@ -48,9 +85,9 @@ def load_translations(override_language=None):
         language = get_language_from_settings()
         print(f"Selected language: {language}")
 
-    # Get all current languages
-    for i in os.listdir(translations_dir):
-        languages.append(i.split(".")[0])
+    # Get all current languages. User downloads override, but never replace, the
+    # immutable translations bundled with the extension.
+    languages.extend(sorted(_available_translation_files()))
     print(f"Available languages: {languages}")
 
     # Determine the language to load
@@ -62,21 +99,19 @@ def load_translations(override_language=None):
         language_to_load = "en_US"
 
     # Load the translation file
-    translation_file = os.path.join(translations_dir, language_to_load + ".json")
-    if os.path.exists(translation_file):
+    messages, translation_file = _load_translation_messages(language_to_load)
+    if messages is not None:
         print(f"Loading translation file: {translation_file}")
-        with open(translation_file, 'r') as file:
-            dictionary = json.load(fp=file)["messages"]
+        dictionary = messages
         last_loaded_language = language_to_load
         print(f"Loaded {len(dictionary)} translations from {language_to_load}")
     else:
         print(f"Translation file not found for language: {language_to_load}")
         # Load the default "en_US" translation file as last resort
-        default_file = os.path.join(translations_dir, "en_US.json")
-        if os.path.exists(default_file):
+        messages, default_file = _load_translation_messages("en_US")
+        if messages is not None:
             print(f"Loading fallback translation file: {default_file}")
-            with open(default_file, 'r') as file:
-                dictionary = json.load(fp=file)["messages"]
+            dictionary = messages
             last_loaded_language = "en_US"
             print(f"Loaded {len(dictionary)} translations from en_US (fallback)")
         else:
@@ -163,6 +198,11 @@ def update_ui(self, context):
 
 
 def get_language_from_settings():
+    Paths.migrate_legacy_file(
+        Paths.BUNDLED_RESOURCES_DIR / "settings.json",
+        Paths.SETTINGS_FILE,
+    )
+
     # Load settings file
     try:
         with open(settings_file, encoding="utf8") as file:
@@ -201,16 +241,14 @@ def convert_locale_to_language_code(blender_locale):
     locale_str = str(blender_locale)
 
     # Check if exact match exists in available languages
-    for lang_file in os.listdir(translations_dir):
-        lang_code = lang_file.split(".")[0]
+    for lang_code in _available_translation_files():
         if locale_str == lang_code:
             print(f"Found exact locale match: {lang_code}")
             return lang_code
 
     # Try to match by language code (first part before underscore)
     language_only = locale_str.split("_")[0].lower() if "_" in locale_str else locale_str.lower()
-    for lang_file in os.listdir(translations_dir):
-        lang_code = lang_file.split(".")[0]
+    for lang_code in _available_translation_files():
         if lang_code.lower().startswith(language_only):
             print(f"Found language match: {lang_code}")
             return lang_code
@@ -227,6 +265,10 @@ class DownloadTranslations(bpy.types.Operator):
     bl_options = {'INTERNAL'}
 
     def execute(self, context):
+        if not getattr(bpy.app, "online_access", True):
+            self.report({'ERROR'}, "Online access is disabled in Blender preferences")
+            return {'CANCELLED'}
+
         # GitHub repository and folder information
         repo_owner = "teamneoneko"
         repo_name = "Cats-Blender-Plugin-Unofficial-translations"
@@ -236,49 +278,74 @@ class DownloadTranslations(bpy.types.Operator):
         # Construct the API URL to get the list of files in the folder
         api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents/{folder_path}?ref={branch}"
 
+        request_options = {
+            "headers": {"User-Agent": "Cats-Blender-Plugin-Translations"},
+            "timeout": 20,
+        }
         try:
             # Send a GET request to the API URL
-            response = requests.get(api_url)
+            response = requests.get(api_url, **request_options)
             response.raise_for_status()  # Raise an exception if the request was unsuccessful
 
             # Parse the JSON response
             files = response.json()
+            if not isinstance(files, list):
+                raise ValueError("GitHub returned an unexpected folder response")
 
             # Download each translation file
-            for file in files:
-                if file["type"] == "file" and file["name"].endswith(".json"):
-                    file_url = file["download_url"]
-                    file_name = file["name"]
-                    file_path = os.path.join(translations_dir, file_name)
+            translation_payloads = []
+            for file_info in files:
+                file_name = file_info.get("name", "")
+                safe_name = os.path.basename(file_name)
+                if (
+                    file_info.get("type") == "file"
+                    and file_name == safe_name
+                    and re.fullmatch(r"[A-Za-z0-9_.-]+\.json", safe_name)
+                ):
+                    file_url = file_info.get("download_url")
+                    if not file_url:
+                        raise ValueError(f"Missing download URL for {safe_name}")
 
                     # Download the translation file
-                    file_response = requests.get(file_url)
+                    file_response = requests.get(file_url, **request_options)
                     file_response.raise_for_status()
+                    payload = file_response.json()
+                    messages = payload.get("messages") if isinstance(payload, dict) else None
+                    if not isinstance(messages, dict) or not all(
+                        isinstance(key, str) and isinstance(value, str)
+                        for key, value in messages.items()
+                    ):
+                        raise ValueError(f"Invalid translation JSON in {safe_name}")
+                    translation_payloads.append((safe_name, payload))
 
-                    # Save the translation file
-                    with open(file_path, 'wb') as file:
-                        file.write(file_response.content)
+            if not translation_payloads:
+                raise ValueError("No translation JSON files were found")
 
-                    print(f"Downloaded: {file_name}")
+            for file_name, payload in translation_payloads:
+                file_path = Paths.USER_TRANSLATIONS_DIR / file_name
+                Paths.atomic_write_json(file_path, payload)
+                print(f"Downloaded: {file_name}")
 
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, OSError, ValueError, TypeError) as e:
             print("TRANSLATIONS FILES COULD NOT BE DOWNLOADED")
             self.report({'ERROR'}, "TRANSLATIONS FILES COULD NOT BE DOWNLOADED: " + str(e))
             return {'CANCELLED'}
 
         print('TRANSLATIONS DOWNLOAD FINISHED')
 
-        # Define the dictionary file path
-        dictionary_file = os.path.join(resources_dir, "dictionary.json")
-
         # Download dictionary.json from GitHub
         print('DOWNLOAD DICTIONARY FILE')
         try:
-            response = requests.get(dictionary_download_link)
+            response = requests.get(dictionary_download_link, **request_options)
             response.raise_for_status()  # Raise an exception if the request was unsuccessful
-            with open(dictionary_file, 'wb') as file:
-                file.write(response.content)
-        except requests.exceptions.RequestException as e:
+            dictionary_payload = response.json()
+            if not isinstance(dictionary_payload, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in dictionary_payload.items()
+            ):
+                raise ValueError("Invalid dictionary JSON")
+            Paths.atomic_write_json(Paths.DOWNLOADED_DICTIONARY_FILE, dictionary_payload)
+        except (requests.exceptions.RequestException, OSError, ValueError, TypeError) as e:
             print("DICTIONARY FILE COULD NOT BE DOWNLOADED")
             self.report({'ERROR'}, "DICTIONARY FILE COULD NOT BE DOWNLOADED: " + str(e))
             return {'CANCELLED'}

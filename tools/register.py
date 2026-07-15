@@ -46,13 +46,23 @@ def order_classes():
     # Put all the UI into the list first
     __bl_ordered_classes = []
     for cls in __bl_classes:
-        if cls.__module__.startswith('ui.'):
+        if _is_ui_class(cls):
             __bl_ordered_classes.append(cls)
 
     # Then put everything else sorted into the list
     for cls in toposort(deps_dict):
-        if not cls.__module__.startswith('ui.'):
+        if not _is_ui_class(cls):
             __bl_ordered_classes.append(cls)
+
+
+def _is_ui_class(cls):
+    """Return whether a class belongs to CATS' ui package.
+
+    Blender extensions import modules under a generated package namespace (for
+    example ``bl_ext.user_default.cats_blender_plugin.ui.main``), so checking
+    whether the module starts with ``ui.`` never matched installed builds.
+    """
+    return 'ui' in cls.__module__.split('.')
 
 
 def iter_classes_to_register():

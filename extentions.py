@@ -19,6 +19,81 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, St
 documents_folder = pathlib.Path.home() / "Documents"
 default_exports_dir = os.path.join(documents_folder, "Cats")
 
+# Keep ownership of every property added to bpy.types.Scene so disabling or
+# reloading CATS leaves Blender's RNA type exactly as it was before registration.
+_REGISTERED_SCENE_PROPERTIES = (
+    'remove_rigidbodies_joints_global',
+    'custom_translate_csv_export_dir',
+    'export_translate_csv',
+    'pose_to_shapekey_name',
+    'progress_update',
+    'generate_twistbones_upper',
+    'armature',
+    'zip_content',
+    'keep_upper_chest',
+    'remove_zero_weight',
+    'eye_tracking_mode',
+    'keep_end_bones',
+    'keep_twist_bones',
+    'fix_twist_bones',
+    'join_meshes',
+    'connect_bones',
+    'remove_rigidbodies_joints',
+    'use_google_only',
+    'skip_locked_shape_keys',
+    'keep_merged_bones',
+    'merge_visible_meshes_only',
+    'show_more_options',
+    'merge_mode',
+    'merge_armature_into',
+    'merge_armature',
+    'attach_to_bone',
+    'attach_mesh',
+    'merge_same_bones',
+    'apply_transforms',
+    'merge_armatures_join_meshes',
+    'merge_armatures_remove_zero_weight_bones',
+    'delete_zero_weight_keep_twists',
+    'delete_zero_weight_keep_empty_parents',
+    'delete_zero_weight_skip_hidden_bones',
+    'merge_armatures_cleanup_shape_keys',
+    'selection_mode',
+    'eye_mode',
+    'mesh_name_eye',
+    'head',
+    'eye_left',
+    'eye_right',
+    'wink_left',
+    'wink_right',
+    'lowerlid_left',
+    'lowerlid_right',
+    'disable_eye_movement',
+    'disable_eye_blinking',
+    'eye_distance',
+    'eye_rotation_x',
+    'eye_rotation_y',
+    'iris_height',
+    'eye_blink_shape',
+    'eye_lowerlid_shape',
+    'viseme_preview_mode',
+    'viseme_preview_selection',
+    'viseme_validate_deformation',
+    'remove_doubles_threshold',
+    'mesh_name_viseme',
+    'mouth_a',
+    'mouth_o',
+    'mouth_ch',
+    'shape_intensity',
+    'root_bone',
+    'optimize_mode',
+    'merge_ratio',
+    'merge_mesh',
+    'merge_bone',
+    'embed_textures',
+    'ui_lang',
+    'debug_translations',
+)
+
 def register(): 
     Scene.remove_rigidbodies_joints_global = BoolProperty(
         name=t('Scene.removerigidbodiesjointsglobal.label'),
@@ -37,6 +112,11 @@ def register():
         name=t('Scene.shapekeycsv.label'),
         description=t('Scene.shapekeycsv.desc'),
         default = False
+    )
+
+    Scene.pose_to_shapekey_name = StringProperty(
+        name="Pose Name",
+        default="Pose",
     )
 
     Scene.progress_update = FloatProperty(
@@ -528,3 +608,9 @@ def register():
         description=t('Scene.debug_translations.desc'),
         default=False
     )
+
+
+def unregister():
+    for property_name in reversed(_REGISTERED_SCENE_PROPERTIES):
+        if hasattr(Scene, property_name):
+            delattr(Scene, property_name)

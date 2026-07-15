@@ -316,8 +316,6 @@ class PoseNamePopup(bpy.types.Operator):
     bl_description = t('PoseNamePopup.desc')
     bl_options = {'INTERNAL'}
 
-    bpy.types.Scene.pose_to_shapekey_name = bpy.props.StringProperty(name="Pose Name")
-
     def execute(self, context):
         name = context.scene.pose_to_shapekey_name
         if not name:

@@ -733,6 +733,46 @@ eye_left_rot = []
 eye_right_rot = []
 
 
+def _armature_has_eye_test_bones():
+    """Safely check the prerequisites used by eye-test operator polls."""
+    try:
+        armature = Common.get_armature()
+        bones = getattr(getattr(armature, 'pose', None), 'bones', None)
+        return (
+            bones is not None
+            and bones.get('LeftEye') is not None
+            and bones.get('RightEye') is not None
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return False
+
+
+def _get_eye_test_mesh(context):
+    """Return the configured eye mesh, or None for an incomplete scene."""
+    try:
+        scene = getattr(context, 'scene', None)
+        mesh_name = getattr(scene, 'mesh_name_eye', '')
+        mesh = Common.get_objects().get(mesh_name) if mesh_name else None
+        return mesh if mesh is not None and mesh.type == 'MESH' else None
+    except (AttributeError, KeyError, ReferenceError, RuntimeError, TypeError):
+        return None
+
+
+def _eye_mesh_has_shape_keys(context, *shape_names):
+    mesh = _get_eye_test_mesh(context)
+    if mesh is None:
+        return False
+
+    try:
+        shape_keys = mesh.data.shape_keys
+        if shape_keys is None:
+            return False
+        key_blocks = shape_keys.key_blocks
+        return all(key_blocks.get(name) is not None for name in shape_names)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return False
+
+
 @register_wrap
 class StartTestingButton(bpy.types.Operator):
     bl_idname = 'cats_eyes.start_testing'
@@ -742,12 +782,7 @@ class StartTestingButton(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        armature = Common.get_armature()
-        if 'LeftEye' in armature.pose.bones:
-            if 'RightEye' in armature.pose.bones:
-                if Common.get_objects().get(context.scene.mesh_name_eye) is not None:
-                    return True
-        return False
+        return _armature_has_eye_test_bones() and _get_eye_test_mesh(context) is not None
 
     def execute(self, context):
         armature = Common.set_default_stage()
@@ -909,11 +944,7 @@ class ResetRotationButton(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        armature = Common.get_armature()
-        if 'LeftEye' in armature.pose.bones:
-            if 'RightEye' in armature.pose.bones:
-                return True
-        return False
+        return _armature_has_eye_test_bones()
 
     def execute(self, context):
         armature = Common.get_armature()
@@ -949,11 +980,7 @@ class AdjustEyesButton(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        armature = Common.get_armature()
-        if 'LeftEye' in armature.pose.bones:
-            if 'RightEye' in armature.pose.bones:
-                return True
-        return False
+        return _armature_has_eye_test_bones()
 
     def execute(self, context):
         if context.scene.disable_eye_movement:
@@ -1003,11 +1030,7 @@ class StartIrisHeightButton(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        armature = Common.get_armature()
-        if 'LeftEye' in armature.pose.bones:
-            if 'RightEye' in armature.pose.bones:
-                return True
-        return False
+        return _armature_has_eye_test_bones()
 
     def execute(self, context):
         if context.scene.disable_eye_movement:
@@ -1052,12 +1075,11 @@ class TestBlinking(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        mesh = Common.get_objects()[context.scene.mesh_name_eye]
-        if Common.has_shapekeys(mesh):
-            if 'vrc.blink_left' in mesh.data.shape_keys.key_blocks:
-                if 'vrc.blink_right' in mesh.data.shape_keys.key_blocks:
-                    return True
-        return False
+        return _eye_mesh_has_shape_keys(
+            context,
+            'vrc.blink_left',
+            'vrc.blink_right',
+        )
 
     def execute(self, context):
         mesh = Common.get_objects()[context.scene.mesh_name_eye]
@@ -1081,12 +1103,11 @@ class TestLowerlid(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        mesh = Common.get_objects()[context.scene.mesh_name_eye]
-        if Common.has_shapekeys(mesh):
-            if 'vrc.lowerlid_left' in mesh.data.shape_keys.key_blocks:
-                if 'vrc.lowerlid_right' in mesh.data.shape_keys.key_blocks:
-                    return True
-        return False
+        return _eye_mesh_has_shape_keys(
+            context,
+            'vrc.lowerlid_left',
+            'vrc.lowerlid_right',
+        )
 
     def execute(self, context):
         mesh = Common.get_objects()[context.scene.mesh_name_eye]

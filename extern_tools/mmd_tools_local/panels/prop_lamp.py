@@ -7,7 +7,10 @@ from ..core.lamp import MMDLamp
 
 
 class MMDLampPanel(Panel):
-    bl_idname = "OBJECT_PT_mmd_tools_local_light"
+    # Keep the legacy lamp panel distinct from the Blender 2.80+ light panel.
+    # Both modules are still discovered by mmd_tools' auto-loader, and sharing
+    # an identifier makes registration order decide which panel survives.
+    bl_idname = "OBJECT_PT_mmd_tools_local_legacy_lamp"
     bl_label = "MMD Light Tools"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"

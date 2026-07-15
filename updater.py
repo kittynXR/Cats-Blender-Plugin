@@ -1,20 +1,20 @@
 # MIT License
 
 import os
-import ssl
 import bpy
-import time
 import json
-import urllib
+import stat
+import urllib.error
+import urllib.request
 import shutil
-import pathlib
 import zipfile
-import addon_utils
 from threading import Thread
+from queue import Empty, Queue
 from collections import OrderedDict
 from bpy.app.handlers import persistent
 from .tools.translations import t
 from .tools.common import wrap_dynamic_enum_items
+from .tools import paths as Paths
 from . import CATS_VERSION, dev_branch
 
 no_ver_check = False
@@ -38,16 +38,29 @@ confirm_update_to = ''
 show_error = ''
 
 main_dir = os.path.dirname(__file__)
-downloads_dir = os.path.join(main_dir, "downloads")
+downloads_dir = str(Paths.UPDATER_DOWNLOADS_DIR)
 resources_dir = os.path.join(main_dir, "resources")
-ignore_ver_file = os.path.join(resources_dir, "ignore_version.txt")
-no_auto_ver_check_file = os.path.join(resources_dir, "no_auto_ver_check.txt")
+ignore_ver_file = str(Paths.UPDATER_IGNORE_VERSION_FILE)
+no_auto_ver_check_file = str(Paths.UPDATER_DISABLE_AUTO_CHECK_FILE)
+Paths.migrate_legacy_file(
+    os.path.join(resources_dir, "ignore_version.txt"),
+    Paths.UPDATER_IGNORE_VERSION_FILE,
+)
+Paths.migrate_legacy_file(
+    os.path.join(resources_dir, "no_auto_ver_check.txt"),
+    Paths.UPDATER_DISABLE_AUTO_CHECK_FILE,
+)
 
 # Get package name, important for panel in user preferences
-package_name = ''
-for mod in addon_utils.modules():
-    if mod.bl_info['name'] == 'Cats Blender Plugin':
-        package_name = mod.__name__
+package_name = __package__
+
+_update_result_queue = Queue()
+
+
+def online_access_allowed():
+    """Honor Blender's per-user online access preference."""
+    return bool(getattr(bpy.app, "online_access", True))
+
 
 # Icons for UI
 ICON_URL = 'URL'
@@ -60,7 +73,7 @@ class CheckForUpdateButton(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return not is_checking_for_update
+        return not is_checking_for_update and online_access_allowed()
 
     def execute(self, context):
         global used_updater_panel
@@ -77,7 +90,7 @@ class UpdateToLatestButton(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return update_needed
+        return update_needed and online_access_allowed()
 
     def execute(self, context):
         global confirm_update_to, used_updater_panel
@@ -96,7 +109,7 @@ class UpdateToSelectedButton(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        if is_checking_for_update or not version_list:
+        if is_checking_for_update or not version_list or not online_access_allowed():
             return False
         return True
 
@@ -114,6 +127,10 @@ class UpdateToDevButton(bpy.types.Operator):
     bl_label = t('UpdateToDevButton.label')
     bl_description = t('UpdateToDevButton.desc')
     bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return online_access_allowed()
 
     def execute(self, context):
         global confirm_update_to, used_updater_panel
@@ -370,22 +387,49 @@ def check_for_update_background(check_on_startup=False):
         print('AUTO CHECK DISABLED VIA FILE')
         return
 
-    is_checking_for_update = True
+    if not online_access_allowed():
+        checked_on_startup = True
+        finish_update_checking(error="Online access is disabled in Blender preferences")
+        return
 
-    thread = Thread(target=check_for_update, args=[])
+    is_checking_for_update = True
+    while True:
+        try:
+            _update_result_queue.get_nowait()
+        except Empty:
+            break
+
+    if not bpy.app.timers.is_registered(_poll_update_result):
+        bpy.app.timers.register(_poll_update_result, first_interval=0.1)
+
+    thread = Thread(
+        target=_fetch_update_worker,
+        args=(_release_series(),),
+        daemon=True,
+    )
     thread.start()
 
 
 def check_for_update():
+    """Synchronous update check retained for callers and test harnesses."""
     print('Checking for Cats update...')
 
-    # Get all releases from Github
-    if not get_github_releases('teamneoneko'):
+    if not online_access_allowed():
+        finish_update_checking(error="Online access is disabled in Blender preferences")
+        return
+
+    if not get_github_releases('kittynXR'):
         finish_update_checking(error=t('check_for_update.cantCheck'))
         return
 
-    # Check if an update is needed
+    _complete_update_check()
+
+
+def _complete_update_check():
+    """Apply fetched results and touch Blender state only on the main thread."""
     global update_needed, is_ignored_version
+
+    # Check if an update is needed
     update_needed = check_for_update_available()
     is_ignored_version = check_ignored_version()
 
@@ -401,93 +445,141 @@ def check_for_update():
     finish_update_checking()
 
 
-def get_github_releases(repo):
-    global version_list
-    version_list = OrderedDict()
+def _release_series(blender_version=None):
+    blender_version = blender_version or bpy.app.version
+    return f"{blender_version[0]}.{blender_version[1]}."
 
+
+def _normalize_release_tag(tag):
+    """Return a stable dotted numeric tag, accepting v/hyphen variants."""
+    if not isinstance(tag, str):
+        return None
+    normalized = tag.strip().replace('-', '.')
+    if normalized.lower().startswith('v.'):
+        normalized = normalized[2:]
+    elif normalized.lower().startswith('v'):
+        normalized = normalized[1:]
+    parts = normalized.split('.')
+    if len(parts) < 3 or any(not part.isdigit() for part in parts):
+        return None
+    return '.'.join(str(int(part)) for part in parts)
+
+
+def _version_tuple(version):
+    normalized = _normalize_release_tag(version)
+    if normalized is None:
+        return tuple()
+    return tuple(int(part) for part in normalized.split('.'))
+
+
+def _download_github_releases():
+    req = urllib.request.Request(
+        'https://api.github.com/repos/kittynXR/Cats-Blender-Plugin/releases',
+        headers={'User-Agent': 'Cats-Blender-Plugin-Updater'},
+    )
+    with urllib.request.urlopen(req, timeout=20) as url:
+        data = json.loads(url.read().decode('utf8'))
+    if not isinstance(data, list):
+        raise ValueError("GitHub returned an unexpected release response")
+    return data
+
+
+def _build_version_list(data, series):
+    releases = []
+    for release in data:
+        if (not isinstance(release, dict)
+                or release.get('draft')
+                or release.get('prerelease')):
+            continue
+        normalized_tag = _normalize_release_tag(release.get('tag_name'))
+        if not normalized_tag or not normalized_tag.startswith(series):
+            continue
+        zipball_url = release.get('zipball_url')
+        if not isinstance(zipball_url, str) or not zipball_url:
+            continue
+        published_at = release.get('published_at') or ''
+        if not isinstance(published_at, str):
+            published_at = ''
+        body = release.get('body') or ''
+        if not isinstance(body, str):
+            body = ''
+        releases.append((
+            _version_tuple(normalized_tag),
+            normalized_tag,
+            [
+                zipball_url,
+                body,
+                published_at.split('T')[0],
+            ],
+        ))
+
+    releases.sort(key=lambda item: item[0], reverse=True)
+    return OrderedDict((tag, metadata) for _, tag, metadata in releases)
+
+
+def _fetch_update_worker(series):
+    """Network-only worker. Blender API changes are deferred to the timer."""
+    try:
+        data = _download_github_releases()
+        result = _build_version_list(data, series)
+        _update_result_queue.put((result, None))
+    except Exception as error:
+        _update_result_queue.put((None, str(error)))
+
+
+def _poll_update_result():
+    global version_list
+    try:
+        result, error = _update_result_queue.get_nowait()
+    except Empty:
+        return 0.1 if is_checking_for_update else None
+
+    if error is not None:
+        version_list = OrderedDict()
+        print(f'Could not check for Cats update: {error}')
+        finish_update_checking(error=t('check_for_update.cantCheck'))
+        return None
+
+    version_list = result
+    _complete_update_check()
+    return None
+
+
+def get_github_releases(repo):
+    """Fetch releases synchronously and keep only the active Blender series."""
+    global version_list
     if fake_update:
         print('FAKE INSTALL!')
-
-        version = 'v-99-99-99'
-        version_tag = version.replace('-', '.')
-        if version_tag.startswith('v.'):
-            version_tag = version_tag[2:]
-        if version_tag.startswith('v'):
-            version_tag = version_tag[1:]
-
-        version_list[version_tag] = ['', 'Put exiting new stuff here', 'Today']
-        version_list['12.34.56.78'] = ['', 'Nothing new to see', 'A week ago probably']
+        series = _release_series()
+        version_list = OrderedDict((
+            (series + '99.99', ['', 'Put exciting new stuff here', 'Today']),
+            (series + '98.0', ['', 'Nothing new to see', 'A week ago probably']),
+        ))
         return True
 
     try:
-        ssl._create_default_https_context = ssl._create_unverified_context
-        # GitHub's API rejects requests without a User-Agent header
-        req = urllib.request.Request(
-            'https://api.github.com/repos/kittynXR/Cats-Blender-Plugin/releases',
-            headers={'User-Agent': 'Cats-Blender-Plugin-Updater'}
-        )
-        with urllib.request.urlopen(req) as url:
-            data = json.loads(url.read().decode())
-    except urllib.error.URLError:
-        print('URL ERROR')
+        data = _download_github_releases()
+    except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as error:
+        print(f'URL ERROR: {error}')
+        version_list = OrderedDict()
         return False
-    if not data:
-        return False
-
-    # Determine tag prefix based on Blender version
-    tag_prefix = ""
-    if bpy.app.version >= (5, 0) and bpy.app.version < (5, 1):
-        tag_prefix = "5.0."
-    elif bpy.app.version >= (5, 1) and bpy.app.version < (5, 2):
-        tag_prefix = "5.1."
-
-    for version in data:
-        full_tag = version.get('tag_name')
-        
-        # If we have a tag prefix, skip versions that don't match
-        if tag_prefix and not full_tag.startswith(tag_prefix):
-            continue   
-            
-        version_tag = full_tag
-        
-        # Remove prefix if present
-        if tag_prefix and version_tag.startswith(tag_prefix):
-            version_tag = version_tag[len(tag_prefix):]
-        
-        # Normalize version_tag 
-        version_tag = version_tag.replace('-', '.')
-        if version_tag.startswith('v.'):
-            version_tag = version_tag[2:]
-        if version_tag.startswith('v'):
-            version_tag = version_tag[1:]
-        
-        # Store full tag  
-        version_list[full_tag] = [
-            version['zipball_url'],
-            version['body'],
-            version['published_at'].split('T')[0]
-        ]
-
+    version_list = _build_version_list(data, _release_series())
     return True
 
 
 def check_for_update_available():
+    global latest_version, latest_version_str
+    latest_version = []
+    latest_version_str = ''
+
     if not version_list:
         return False
 
-    global latest_version, latest_version_str
-    latest_version = []
-    for version in version_list.keys():
-        latest_version_str = version
-        for i in version.split('.'):
-            if i.isdigit():
-                latest_version.append(int(i))
-        if latest_version:
-            break
+    latest_version_str = next(iter(version_list))
+    latest_version = list(_version_tuple(latest_version_str))
 
     # print(latest_version, '>', current_version)
-    if latest_version > current_version:
-        return True
+    return tuple(latest_version) > tuple(current_version)
 
 
 def finish_update_checking(error=''):
@@ -503,17 +595,12 @@ def finish_update_checking(error=''):
 
 def ui_refresh():
     # A way to refresh the ui
-    refreshed = False
-    while not refreshed:
-        if hasattr(bpy.data, 'window_managers'):
-            for windowManager in bpy.data.window_managers:
-                for window in windowManager.windows:
-                    for area in window.screen.areas:
-                        area.tag_redraw()
-            refreshed = True
-            # print('Refreshed UI')
-        else:
-            time.sleep(0.5)
+    if not hasattr(bpy.data, 'window_managers'):
+        return
+    for windowManager in bpy.data.window_managers:
+        for window in windowManager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
 
 
 def get_update_post():
@@ -533,7 +620,7 @@ def prepare_to_show_update_notification():
 
 
 @persistent
-def show_update_notification(scene):  # One argument in necessary for some reason
+def show_update_notification(*_args):
     # print('SHOWING UI NOW!!!!')
 
     # # Immediately remove this from handlers again
@@ -546,13 +633,20 @@ def show_update_notification(scene):  # One argument in necessary for some reaso
 
 
 def update_now(version=None, latest=False, dev=False):
+    if not online_access_allowed():
+        finish_update(error="Online access is disabled in Blender preferences")
+        return
     if fake_update:
         finish_update()
         return
     if dev:
         print('UPDATE TO DEVELOPMENT')
-        # Dev branch archive on the GitHub fork
-        update_link = 'https://github.com/kittynXR/Cats-Blender-Plugin/archive/refs/heads/blender-51-dev.zip'
+        major, minor = bpy.app.version[:2]
+        branch = f'blender-{major}{minor}-dev'
+        update_link = (
+            'https://github.com/kittynXR/Cats-Blender-Plugin/'
+            f'archive/refs/heads/{branch}.zip'
+        )
     elif latest or not version:
         print('UPDATE TO ' + latest_version_str)
         update_link = version_list.get(latest_version_str)[0]
@@ -564,6 +658,23 @@ def update_now(version=None, latest=False, dev=False):
     download_file(update_link)
 
 
+def _safe_extract(zip_ref, destination):
+    """Extract an update archive only when every member stays in destination."""
+    destination = os.path.realpath(destination)
+    for member in zip_ref.infolist():
+        file_type = (member.external_attr >> 16) & 0o170000
+        if file_type == stat.S_IFLNK:
+            raise ValueError(f"Symbolic link in update archive: {member.filename}")
+        target = os.path.realpath(os.path.join(destination, member.filename))
+        try:
+            inside_destination = os.path.commonpath((destination, target)) == destination
+        except ValueError:
+            inside_destination = False
+        if not inside_destination:
+            raise ValueError(f"Unsafe path in update archive: {member.filename}")
+    zip_ref.extractall(destination)
+
+
 def download_file(update_url):
     # Load all the directories and files
     update_zip_file = os.path.join(downloads_dir, "cats-update.zip")
@@ -571,19 +682,24 @@ def download_file(update_url):
     # Remove existing download folder
     if os.path.isdir(downloads_dir):
         print("DOWNLOAD FOLDER EXISTED")
-        shutil.rmtree(downloads_dir)
+        shutil.rmtree(downloads_dir, ignore_errors=True)
 
     # Create download folder
-    pathlib.Path(downloads_dir).mkdir(exist_ok=True)
+    os.makedirs(downloads_dir, exist_ok=True)
 
     # Download zip
     print('DOWNLOAD FILE')
     try:
-        ssl._create_default_https_context = ssl._create_unverified_context
-        urllib.request.urlretrieve(update_url, update_zip_file)
-    except urllib.error.URLError:
+        request = urllib.request.Request(
+            update_url,
+            headers={'User-Agent': 'Cats-Blender-Plugin-Updater'},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            with open(update_zip_file, 'wb') as output_file:
+                shutil.copyfileobj(response, output_file)
+    except (OSError, urllib.error.URLError):
         print("FILE COULD NOT BE DOWNLOADED")
-        shutil.rmtree(downloads_dir)
+        shutil.rmtree(downloads_dir, ignore_errors=True)
         finish_update(error=t('download_file.cantConnect'))
         return
     print('DOWNLOAD FINISHED')
@@ -591,14 +707,20 @@ def download_file(update_url):
     # If zip is not downloaded, abort
     if not os.path.isfile(update_zip_file):
         print("ZIP NOT FOUND!")
-        shutil.rmtree(downloads_dir)
+        shutil.rmtree(downloads_dir, ignore_errors=True)
         finish_update(error=t('download_file.cantFindZip'))
         return
 
     # Extract the downloaded zip
     print('EXTRACTING ZIP')
-    with zipfile.ZipFile(update_zip_file, "r") as zip_ref:
-        zip_ref.extractall(downloads_dir)
+    try:
+        with zipfile.ZipFile(update_zip_file, "r") as zip_ref:
+            _safe_extract(zip_ref, downloads_dir)
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        print(f"UPDATE ARCHIVE COULD NOT BE EXTRACTED: {error}")
+        shutil.rmtree(downloads_dir, ignore_errors=True)
+        finish_update(error=t('download_file.cantFindZip'))
+        return
     print('EXTRACTED')
 
     # Delete the extracted zip file
@@ -625,7 +747,7 @@ def download_file(update_url):
     extracted_zip_dir = searchInit(downloads_dir)
     if not extracted_zip_dir:
         print("INIT NOT FOUND!")
-        shutil.rmtree(downloads_dir)
+        shutil.rmtree(downloads_dir, ignore_errors=True)
         # finish_reloading()
         finish_update(error=t('download_file.cantFindCATS'))
         return
@@ -659,7 +781,7 @@ def download_file(update_url):
 
     # Delete download folder
     print('DELETE DOWNLOADS DIR')
-    shutil.rmtree(downloads_dir)
+    shutil.rmtree(downloads_dir, ignore_errors=True)
 
     # Finish the update
     finish_update()
@@ -728,8 +850,8 @@ def clean_addon_dir():
 
 
 def set_ignored_version():
-    # Create resources folder
-    pathlib.Path(resources_dir).mkdir(exist_ok=True)
+    # Keep updater state in Blender's user configuration, not the extension.
+    Paths.UPDATER_STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Create ignore file
     with open(ignore_ver_file, 'w', encoding="utf8") as outfile:
@@ -742,6 +864,9 @@ def set_ignored_version():
 
 
 def check_ignored_version():
+    if not latest_version_str:
+        return False
+
     if not os.path.isfile(ignore_ver_file):
         # print('IGNORE FILE NOT FOUND')
         return False
@@ -995,6 +1120,14 @@ def register(dev_branch, version_str):
 
 
 def unregister():
+    global is_checking_for_update
+    is_checking_for_update = False
+    if bpy.app.timers.is_registered(_poll_update_result):
+        bpy.app.timers.unregister(_poll_update_result)
+    update_post = get_update_post()
+    if show_update_notification in update_post:
+        update_post.remove(show_update_notification)
+
     # Unregister all Updater classes
     for cls in reversed(to_register):
         try:
