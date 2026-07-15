@@ -1,13 +1,13 @@
 # MIT License
 
-CATS_VERSION = "5.1.1.0"
+CATS_VERSION = "5.2.0.0"
 dev_branch = False
 
 # Each release line declares the Blender versions it has actually been tested
-# against.  The upper bound is exclusive so the 5.1 bridge cannot silently be
+# against.  The upper bound is exclusive so this release cannot silently be
 # enabled on a future Blender API.
-BLENDER_VERSION_MIN = (5, 1, 0)
-BLENDER_VERSION_MAX = (5, 2, 0)
+BLENDER_VERSION_MIN = (5, 2, 0)
+BLENDER_VERSION_MAX = (5, 3, 0)
 
 import os
 import sys
