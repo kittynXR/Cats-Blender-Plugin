@@ -11,6 +11,7 @@ import shutil
 import bpy_extras.io_utils
 import time
 import subprocess
+from collections import namedtuple
 from mathutils import Matrix
 from math import isfinite, sqrt
 
@@ -2045,16 +2046,23 @@ def _shape_key_is_broken(shape_key, basis_key):
     return False
 
 
-def _update_avatar_export_checks(meshes):
-    """Populate the error popup from the authoritative FBX mesh scope."""
-    global _meshes_count, _tris_count, _mat_list, _broken_shapes, _textures_found, _eye_meshes_not_named_body
+_ExportStats = namedtuple('_ExportStats', [
+    'meshes_count',
+    'tris_count',
+    'mat_list',
+    'broken_shapes',
+    'textures_found',
+    'eye_meshes_not_named_body',
+])
 
-    _meshes_count = len(meshes)
-    _tris_count = 0
-    _mat_list = []
-    _broken_shapes = []
-    _textures_found = False
-    _eye_meshes_not_named_body = []
+
+def _compute_avatar_export_stats(meshes):
+    """Collect the preflight diagnostics for one export mesh scope."""
+    tris_count = 0
+    mat_list = []
+    broken_shapes = []
+    textures_found = False
+    eye_meshes_not_named_body = []
 
     body_exists = any(mesh.name == 'Body' for mesh in meshes)
 
@@ -2062,16 +2070,16 @@ def _update_avatar_export_checks(meshes):
         # The FBX exporter triangulates faces.  Loop triangles model that
         # output; polygon count under-counts every quad and n-gon.
         mesh.data.calc_loop_triangles()
-        _tris_count += len(mesh.data.loop_triangles)
+        tris_count += len(mesh.data.loop_triangles)
 
         for material_slot in mesh.material_slots:
             material = material_slot.material if material_slot else None
             if material is None:
                 continue
-            if material.name not in _mat_list:
-                _mat_list.append(material.name)
+            if material.name not in mat_list:
+                mat_list.append(material.name)
             if _material_has_image_texture(material):
-                _textures_found = True
+                textures_found = True
 
         if not Common.has_shapekeys(mesh):
             continue
@@ -2079,23 +2087,61 @@ def _update_avatar_export_checks(meshes):
         key_blocks = mesh.data.shape_keys.key_blocks
         basis_key = key_blocks[0]
         for shape_key in key_blocks[1:]:
-            if _shape_key_is_broken(shape_key, basis_key) and shape_key.name not in _broken_shapes:
-                _broken_shapes.append(shape_key.name)
+            if _shape_key_is_broken(shape_key, basis_key) and shape_key.name not in broken_shapes:
+                broken_shapes.append(shape_key.name)
 
-        if not body_exists and mesh.name not in _eye_meshes_not_named_body:
+        if not body_exists and mesh.name not in eye_meshes_not_named_body:
             if any(shape_key.name.startswith(('vrc.blink', 'vrc.lower')) for shape_key in key_blocks[1:]):
-                _eye_meshes_not_named_body.append(mesh.name)
+                eye_meshes_not_named_body.append(mesh.name)
+
+    return _ExportStats(
+        meshes_count=len(meshes),
+        tris_count=tris_count,
+        mat_list=mat_list,
+        broken_shapes=broken_shapes,
+        textures_found=textures_found,
+        eye_meshes_not_named_body=eye_meshes_not_named_body,
+    )
+
+
+def _stats_have_warnings(stats):
+    return (
+        stats.meshes_count > max_meshes_light
+        or stats.tris_count > max_tris
+        or len(stats.mat_list) > max_mats
+        or bool(stats.broken_shapes)
+        or (not stats.textures_found and Settings.get_embed_textures())
+        or bool(stats.eye_meshes_not_named_body)
+    )
+
+
+def _update_avatar_export_checks(meshes):
+    """Populate the error popup globals from the authoritative FBX mesh scope."""
+    global _meshes_count, _tris_count, _mat_list, _broken_shapes, _textures_found, _eye_meshes_not_named_body
+
+    stats = _compute_avatar_export_stats(meshes)
+    _meshes_count = stats.meshes_count
+    _tris_count = stats.tris_count
+    _mat_list = stats.mat_list
+    _broken_shapes = stats.broken_shapes
+    _textures_found = stats.textures_found
+    _eye_meshes_not_named_body = stats.eye_meshes_not_named_body
+    return stats
+
+
+def _avatar_export_stats_from_globals():
+    return _ExportStats(
+        meshes_count=_meshes_count,
+        tris_count=_tris_count,
+        mat_list=_mat_list,
+        broken_shapes=_broken_shapes,
+        textures_found=_textures_found,
+        eye_meshes_not_named_body=_eye_meshes_not_named_body,
+    )
 
 
 def _avatar_export_has_warnings():
-    return (
-        _meshes_count > max_meshes_light
-        or _tris_count > max_tris
-        or len(_mat_list) > max_mats
-        or bool(_broken_shapes)
-        or (not _textures_found and Settings.get_embed_textures())
-        or bool(_eye_meshes_not_named_body)
-    )
+    return _stats_have_warnings(_avatar_export_stats_from_globals())
 
 
 def _walk_layer_collections(layer_collection):
@@ -2115,15 +2161,26 @@ class ExportFBX(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
     filename_ext = '.fbx'
     filter_glob = bpy.props.StringProperty(default='*.fbx', options={'HIDDEN'})
 
+    visible_meshes_only: bpy.props.BoolProperty(
+        name=t('ExportModel.visibleOnly.label'),
+        description=t('ExportModel.visibleOnly.desc'),
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+
     def execute(self, context):
-        armature, meshes, export_objects = Common.get_avatar_export_scope()
+        armature, meshes, export_objects = Common.get_avatar_export_scope(
+            visible_only=self.visible_meshes_only)
         _update_avatar_export_checks(meshes)
 
         if armature is None:
             self.report({'ERROR'}, 'No armature is selected for export.')
             return {'CANCELLED'}
         if not meshes:
-            self.report({'ERROR'}, 'The selected armature has no visible avatar meshes to export.')
+            if self.visible_meshes_only:
+                self.report({'ERROR'}, 'The selected armature has no visible meshes to export.')
+            else:
+                self.report({'ERROR'}, 'The selected armature has no meshes to export.')
             return {'CANCELLED'}
 
         view_layer = context.view_layer
@@ -2269,9 +2326,28 @@ class ExportModel(bpy.types.Operator):
 
     filepath = bpy.props.StringProperty()
 
+    visible_meshes_only: bpy.props.BoolProperty(
+        name=t('ExportModel.visibleOnly.label'),
+        description=t('ExportModel.visibleOnly.desc'),
+        default=False,
+        options={'HIDDEN', 'SKIP_SAVE'},
+    )
+
     def execute(self, context):
-        _armature, meshes, _export_objects = Common.get_avatar_export_scope()
+        _armature, meshes, _export_objects = Common.get_avatar_export_scope(
+            visible_only=self.visible_meshes_only)
         _update_avatar_export_checks(meshes)
+
+        # Fail before the file dialog opens, not after a path was picked.
+        if _armature is None:
+            self.report({'ERROR'}, 'No armature is selected for export.')
+            return {'CANCELLED'}
+        if not meshes:
+            if self.visible_meshes_only:
+                self.report({'ERROR'}, 'The selected armature has no visible meshes to export.')
+            else:
+                self.report({'ERROR'}, 'The selected armature has no meshes to export.')
+            return {'CANCELLED'}
 
         # Keep the existing warning popup/continue flow, but make both paths
         # use the same freshly-computed scope and diagnostics.
@@ -2281,9 +2357,14 @@ class ExportModel(bpy.types.Operator):
 
         try:
             if self.filepath:
-                result = bpy.ops.cats_importer.export_fbx('EXEC_DEFAULT', filepath=self.filepath)
+                result = bpy.ops.cats_importer.export_fbx(
+                    'EXEC_DEFAULT',
+                    filepath=self.filepath,
+                    visible_meshes_only=self.visible_meshes_only)
             else:
-                result = bpy.ops.cats_importer.export_fbx('INVOKE_DEFAULT')
+                result = bpy.ops.cats_importer.export_fbx(
+                    'INVOKE_DEFAULT',
+                    visible_meshes_only=self.visible_meshes_only)
             if 'CANCELLED' in result:
                 return {'CANCELLED'}
         except AttributeError:
@@ -2415,24 +2496,14 @@ class Cats_OT_ExportResonite(bpy.types.Operator):
         return False
 
     def execute(self, context: bpy.types.Context):
-        if bpy.app.version[0] < 4:
-            bpy.ops.export_scene.gltf('INVOKE_AREA',
-                export_image_format = 'JPEG',
-                export_jpeg_quality = 75,
-                export_materials = 'EXPORT',
-                export_animations = True,
-                export_animation_mode = 'ACTIONS',
-                export_nla_strips_merged_animation_name = 'Animation',
-                export_nla_strips = True)            
-        else:
-            bpy.ops.export_scene.gltf('INVOKE_AREA',
-                export_image_format = 'WEBP',
-                export_image_quality = 75,
-                export_materials = 'EXPORT',
-                export_animations = True,
-                export_animation_mode = 'ACTIONS',
-                export_nla_strips_merged_animation_name = 'Animation',
-                export_nla_strips = True)
+        bpy.ops.export_scene.gltf('INVOKE_AREA',
+            export_image_format = 'WEBP',
+            export_image_quality = 75,
+            export_materials = 'EXPORT',
+            export_animations = True,
+            export_animation_mode = 'ACTIONS',
+            export_nla_strips_merged_animation_name = 'Animation',
+            export_nla_strips = True)
         return {'FINISHED'}
 
 
@@ -2442,26 +2513,26 @@ class ErrorDisplay(bpy.types.Operator):
     bl_label = t('ErrorDisplay.label')
     bl_options = {'INTERNAL'}
 
-    tris_count = 0
-    mat_list = []
-    mat_count = 0
-    meshes_count = 0
-    broken_shapes = []
-    textures_found = False
-    eye_meshes_not_named_body = []
+    visible_meshes_only: bpy.props.BoolProperty(
+        name=t('ExportModel.visibleOnly.label'),
+        description=t('ExportModel.visibleOnly.desc'),
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+
+    stats_all = None
+    stats_visible = None
 
     def execute(self, context):
         return {'FINISHED'}
 
     def invoke(self, context, event):
-        global _meshes_count, _tris_count, _mat_list, _broken_shapes, _textures_found, _eye_meshes_not_named_body
-        self.meshes_count = _meshes_count
-        self.tris_count = _tris_count
-        self.mat_list = _mat_list
-        self.mat_count = len(_mat_list)
-        self.broken_shapes = _broken_shapes
-        self.textures_found = _textures_found
-        self.eye_meshes_not_named_body = _eye_meshes_not_named_body
+        # ExportModel just populated the globals for the full model scope.
+        # Also compute the visible-only diagnostics so toggling the checkbox
+        # previews exactly what a visible-only export would contain.
+        self.stats_all = _avatar_export_stats_from_globals()
+        _armature, visible_meshes, _objects = Common.get_avatar_export_scope(visible_only=True)
+        self.stats_visible = _compute_avatar_export_stats(visible_meshes)
 
         dpi_value = Common.get_user_preferences().system.dpi
         return context.window_manager.invoke_props_dialog(self, width=int(dpi_value * 6.1))
@@ -2471,18 +2542,23 @@ class ErrorDisplay(bpy.types.Operator):
         return True
 
     def draw(self, context):
+        stats = self.stats_visible if self.visible_meshes_only else self.stats_all
+        if stats is None:
+            return
+        mat_count = len(stats.mat_list)
+
         layout = self.layout
         col = layout.column(align=True)
 
-        if self.tris_count > max_tris:
+        if stats.tris_count > max_tris:
             row = col.row(align=True)
             row.scale_y = 0.75
-            row.label(text=t('ErrorDisplay.polygons1'), icon='ERROR')
+            row.label(text=t('ErrorDisplay.polygons1'), icon='INFO')
             col.separator()
 
             row = col.row(align=True)
             row.scale_y = 0.75
-            row.label(text=t('ErrorDisplay.polygons2', number=str(self.tris_count)))
+            row.label(text=t('ErrorDisplay.polygons2', number=str(stats.tris_count)))
             row = col.row(align=True)
             row.scale_y = 0.75
             row.label(text=t('ErrorDisplay.polygons3'))
@@ -2490,27 +2566,7 @@ class ErrorDisplay(bpy.types.Operator):
             col.separator()
             col.separator()
 
-        # if self.mat_count > 10:
-        #     row = col.row(align=True)
-        #     row.scale_y = 0.75
-        #     row.label(text="Too many materials!", icon='ERROR')
-        #     col.separator()
-        #
-        #     row = col.row(align=True)
-        #     row.scale_y = 0.75
-        #     row.label(text="You have " + str(self.mat_count) + " materials on this model! (max 10)")
-        #     row = col.row(align=True)
-        #     row.scale_y = 0.75
-        #     row.label(text="You should create a texture atlas before you export this model.")
-        #     col.separator()
-        #     row = col.row(align=True)
-        #     row.scale_y = 0.75
-        #     row.label(text="The Auto Atlas in CATS is now better and easier than ever, so please make use of it.")
-        #     col.separator()
-        #     col.separator()
-        #     col.separator()
-
-        if self.mat_count > max_mats:
+        if mat_count > max_mats:
             row = col.row(align=True)
             row.scale_y = 0.75
             row.label(text=t('ErrorDisplay.materials1'), icon='INFO')
@@ -2518,7 +2574,7 @@ class ErrorDisplay(bpy.types.Operator):
 
             row = col.row(align=True)
             row.scale_y = 0.75
-            row.label(text=t('ErrorDisplay.materials2', number=str(self.mat_count)))
+            row.label(text=t('ErrorDisplay.materials2', number=str(mat_count)))
             row = col.row(align=True)
             row.scale_y = 0.75
             row.label(text=t('ErrorDisplay.materials3'))
@@ -2530,19 +2586,19 @@ class ErrorDisplay(bpy.types.Operator):
             col.separator()
             col.separator()
 
-        if self.meshes_count > max_meshes_light:
+        if stats.meshes_count > max_meshes_light:
             row = col.row(align=True)
             row.scale_y = 0.75
-            row.label(text=t('ErrorDisplay.meshes1'), icon='ERROR')
+            row.label(text=t('ErrorDisplay.meshes1'), icon='INFO')
             col.separator()
 
             row = col.row(align=True)
             row.scale_y = 0.75
-            row.label(text=t('ErrorDisplay.meshes2', number=str(self.meshes_count)))
+            row.label(text=t('ErrorDisplay.meshes2', number=str(stats.meshes_count)))
             col.separator()
             row = col.row(align=True)
             row.scale_y = 0.75
-            if self.meshes_count <= max_meshes_hard:
+            if stats.meshes_count <= max_meshes_hard:
                 row.label(text=t('ErrorDisplay.meshes3'))
             else:
                 row.label(text=t('ErrorDisplay.meshes3_alt'))
@@ -2557,7 +2613,7 @@ class ErrorDisplay(bpy.types.Operator):
             col.separator()
             col.separator()
 
-        if self.broken_shapes:
+        if stats.broken_shapes:
             row = col.row(align=True)
             row.scale_y = 0.75
             row.label(text=t('ErrorDisplay.brokenShapekeys1'), icon='ERROR')
@@ -2565,10 +2621,10 @@ class ErrorDisplay(bpy.types.Operator):
 
             row = col.row(align=True)
             row.scale_y = 0.75
-            row.label(text=t('ErrorDisplay.brokenShapekeys2', number=str(len(self.broken_shapes))))
+            row.label(text=t('ErrorDisplay.brokenShapekeys2', number=str(len(stats.broken_shapes))))
             col.separator()
 
-            for shapekey in self.broken_shapes:
+            for shapekey in stats.broken_shapes:
                 row = col.row(align=True)
                 row.scale_y = 0.75
                 row.label(text="  - " + shapekey)
@@ -2584,7 +2640,7 @@ class ErrorDisplay(bpy.types.Operator):
             col.separator()
             col.separator()
 
-        if not self.textures_found and Settings.get_embed_textures():
+        if not stats.textures_found and Settings.get_embed_textures():
             row = col.row(align=True)
             row.scale_y = 0.75
             row.label(text=t('ErrorDisplay.textures1'), icon='ERROR')
@@ -2603,7 +2659,7 @@ class ErrorDisplay(bpy.types.Operator):
             col.separator()
             col.separator()
 
-        if len(self.eye_meshes_not_named_body) == 1:
+        if len(stats.eye_meshes_not_named_body) == 1:
             row = col.row(align=True)
             row.scale_y = 0.75
             row.label(text=t('ErrorDisplay.eyes1'), icon='ERROR')
@@ -2611,15 +2667,15 @@ class ErrorDisplay(bpy.types.Operator):
 
             row = col.row(align=True)
             row.scale_y = 0.75
-            row.label(text=t('ErrorDisplay.eyes2', name=self.eye_meshes_not_named_body[0]))
+            row.label(text=t('ErrorDisplay.eyes2', name=stats.eye_meshes_not_named_body[0]))
             row = col.row(align=True)
             row.scale_y = 0.75
-            row.label(text=t( 'ErrorDisplay.eyes3'))
+            row.label(text=t('ErrorDisplay.eyes3'))
             col.separator()
             col.separator()
             col.separator()
 
-        elif len(self.eye_meshes_not_named_body) > 1:
+        elif len(stats.eye_meshes_not_named_body) > 1:
             row = col.row(align=True)
             row.scale_y = 0.75
             row.label(text=t('ErrorDisplay.eyes1'), icon='ERROR')
@@ -2638,5 +2694,20 @@ class ErrorDisplay(bpy.types.Operator):
             col.separator()
             col.separator()
 
+        if not _stats_have_warnings(stats):
+            row = col.row(align=True)
+            row.scale_y = 0.75
+            row.label(text=t('ErrorDisplay.noWarnings'), icon='CHECKMARK')
+            col.separator()
+            col.separator()
+
+        # Not saved anywhere on purpose: every export starts fresh with the
+        # complete model unless this box is ticked again.
         row = col.row(align=True)
-        row.operator(ExportModel.bl_idname, text=t('ErrorDisplay.continue'), icon=globs.ICON_EXPORT).action = 'NO_CHECK'
+        row.prop(self, 'visible_meshes_only')
+        col.separator()
+
+        row = col.row(align=True)
+        continue_button = row.operator(ExportModel.bl_idname, text=t('ErrorDisplay.continue'), icon=globs.ICON_EXPORT)
+        continue_button.action = 'NO_CHECK'
+        continue_button.visible_meshes_only = self.visible_meshes_only
