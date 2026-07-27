@@ -835,15 +835,18 @@ def _uses_armature_modifier(obj, armature):
     )
 
 
-def get_avatar_export_scope(armature_name=None):
+def get_avatar_export_scope(armature_name=None, visible_only=False):
     """Return the armature, meshes and objects in the CATS avatar FBX scope.
 
-    A mesh belongs to the selected CATS armature when it is visible in the
-    current view layer and either is a recursive descendant of that armature
-    or has an Armature modifier targeting it.  The returned object list adds
-    the target armature and visible parent empties needed to preserve object
-    transforms.  Its mesh members are therefore exactly the returned mesh
-    list used by export preflight.
+    A mesh belongs to the selected CATS armature when it either is a
+    recursive descendant of that armature or has an Armature modifier
+    targeting it.  By default every such mesh is included, hidden or not, so
+    the exported FBX always contains the complete avatar.  Pass
+    ``visible_only=True`` to restrict the scope to meshes (and parent
+    empties) visible in the current view layer.  The returned object list
+    adds the target armature and the parent empties needed to preserve
+    object transforms.  Its mesh members are therefore exactly the returned
+    mesh list used by export preflight.
     """
     context = bpy.context
     armature = get_armature(armature_name=armature_name)
@@ -854,7 +857,7 @@ def get_avatar_export_scope(armature_name=None):
         obj for obj in get_objects()
         if obj is not None
         and obj.type == 'MESH'
-        and is_object_visible(obj, context)
+        and (not visible_only or is_object_visible(obj, context))
         and (_is_descendant_of(obj, armature) or _uses_armature_modifier(obj, armature))
     ]
     meshes.sort(key=lambda obj: obj.name.casefold())
@@ -868,20 +871,20 @@ def get_avatar_export_scope(armature_name=None):
         while parent:
             if (parent.type == 'EMPTY'
                     and parent.instance_type == 'NONE'
-                    and is_object_visible(parent, context)):
+                    and (not visible_only or is_object_visible(parent, context))):
                 export_objects.add(parent)
             parent = parent.parent
 
     return armature, meshes, sorted(export_objects, key=lambda obj: obj.name.casefold())
 
 
-def get_meshes_objects_for_export(armature_name=None, mode=0, check=True):
+def get_meshes_objects_for_export(armature_name=None, mode=0, check=True, visible_only=False):
     """Compatibility wrapper for the authoritative avatar export meshes.
 
     ``mode`` and ``check`` are retained for API compatibility.  FBX export has
     one deliberately fixed scope, so they no longer alter the returned list.
     """
-    _armature, meshes, _objects = get_avatar_export_scope(armature_name)
+    _armature, meshes, _objects = get_avatar_export_scope(armature_name, visible_only=visible_only)
     return meshes
 
 def join_meshes(armature_name=None, mode=0, apply_transformations=True, repair_shape_keys=True):
