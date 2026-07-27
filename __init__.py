@@ -1,6 +1,6 @@
 # MIT License
 
-CATS_VERSION = "5.2.0.0"
+CATS_VERSION = "5.2.1.0"
 dev_branch = False
 
 # Each release line declares the Blender versions it has actually been tested
